@@ -6,6 +6,15 @@
 #include "../agent/agent.c"
 #include "minhook/include/MinHook.h"
 
+// ---- DIAGNOSTIC stage logger: raw WriteFile, opened/closed per line, survives a crash ----
+static char g_stagePath[MAX_PATH];
+static void stage(const char *s) {
+    if (!g_stagePath[0]) return;
+    HANDLE f = CreateFileA(g_stagePath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    char b[300]; DWORD n = (DWORD)snprintf(b, sizeof b, "%lu %s\r\n", GetCurrentThreadId(), s), w; WriteFile(f, b, n, &w, NULL); CloseHandle(f);
+}
+
 #define CORE_VERSION "1.2.0"
 #define CORE_VERSION_W L"1.2.0"
 #define GAME_PE_TIMESTAMP 0x6A9C51E5u
@@ -304,7 +313,7 @@ static uint64_t h_reroll(uint64_t screen) {
     return r;
 }
 
-#define HOOK(rva, h, o) do { o = api_hook(rva, (void *)h); clog("[Hook] %-22s 0x%06X %s", #h, rva, o ? "ok" : "FAILED"); } while (0)
+#define HOOK(rva, h, o) do { stage("hook: " #h); o = api_hook(rva, (void *)h); clog("[Hook] %-22s 0x%06X %s", #h, rva, o ? "ok" : "FAILED"); } while (0)
 static void install_core_hooks(void) {
     HOOK(RVA_HOUSE_UPDATE, h_house_update, o_house_update);
     HOOK(RVA_PASS_DAY, h_pass_day, o_pass_day);
@@ -332,6 +341,7 @@ static void install_core_hooks(void) {
     HOOK(RVA_TRANSITION, h_transition, o_transition);
     // per-frame tick: patch the SDL dynapi jump slot (no inline hook needed)
     uint64_t *slot = slot_of(g_base + RVA_SDL_GL_SWAPWINDOW);
+    stage("hook: SDL swap slot");
     if (slot) { DWORD old; VirtualProtect(slot, 8, PAGE_READWRITE, &old); o_swap = (void *(*)(void *))*slot; *slot = (uint64_t)h_swap; VirtualProtect(slot, 8, old, &old); g_frame_driven = 1; }
     clog("[Hook] frame tick (SDL_GL_SwapWindow slot) %s", slot ? "ok" : "FAILED");
 }
@@ -432,23 +442,32 @@ static LONG CALLBACK crash_veh(EXCEPTION_POINTERS *ep) {
 }
 
 static DWORD WINAPI bootstrap(LPVOID p) {
-    (void)p;
+    (void)p; stage("bootstrap: thread started");
     IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER *)g_base; IMAGE_NT_HEADERS *nt = (IMAGE_NT_HEADERS *)(g_base + dos->e_lfanew);
     uint32_t ts = nt->FileHeader.TimeDateStamp;
     clog("[Bootstrap] MewCore %s, game base %llx, PE timestamp %08X%s", CORE_VERSION, (unsigned long long)g_base, ts, ts == GAME_PE_TIMESTAMP ? " (1.1.21239)" : " (UNSUPPORTED BUILD: hooks disabled)");
-    load_cfg();
+    stage("bootstrap: first clog done"); load_cfg(); stage("bootstrap: load_cfg done");
     if (g_cfg_agent || getenv("MEW_AGENT")) { g_ext_handler = core_console; agent_init(g_self, "agent.log"); }
-    if (ts != GAME_PE_TIMESTAMP) return 0;
-    AddVectoredExceptionHandler(1, crash_veh);
+    if (ts != GAME_PE_TIMESTAMP) { stage("bootstrap: UNSUPPORTED BUILD, exiting"); return 0; }
+    stage("bootstrap: timestamp ok"); AddVectoredExceptionHandler(1, crash_veh); stage("bootstrap: VEH added");
     MH_STATUS st = MH_Initialize(); if (st != MH_OK && st != MH_ERROR_ALREADY_INITIALIZED) { clog("[Bootstrap] MinHook init failed: %s", MH_StatusToString(st)); return 0; }
-    install_core_hooks();
+    stage("bootstrap: MH_Initialize ok"); install_core_hooks(); stage("bootstrap: install_core_hooks done");
     g_api.ApiVersion = 2; g_api.GameBase = (intptr_t)g_base; g_api.Log = api_log; g_api.HookRva = api_hook; g_api.Unhook = api_unhook;
     g_api.Subscribe = api_subscribe; g_api.Unsubscribe = api_unsubscribe; g_api.RegisterConsoleCommand = api_register_cmd; g_api.SendTcpEvent = api_send_event;
     g_api.PatchBytes = api_patch; g_api.NopBytes = api_nop; g_api.RegisterMod = api_register_mod; g_api.RegisterFrameDrain = api_register_drain;
     g_api.CurrentTurnControlPtr = &g_turnControl; g_api.SuppressWarning = api_suppress_warning;
-    load_mods();
+    stage("bootstrap: load_mods begin"); load_mods(); stage("bootstrap: load_mods done");
     clog("[Bootstrap] ready: %d hooks, %d mods", g_nhooks, g_nmods);
     return 0;
+}
+
+// FIX: a thread started inside DllMain kills the game (it starts before the game is initialised).
+// Instead, a timer on the game's main thread fires once the game pumps messages, and only then the bootstrap thread is created.
+static volatile LONG g_booted;
+static VOID CALLBACK boot_timer(HWND w, UINT m, UINT_PTR id, DWORD t) {
+    (void)w; (void)m; (void)t; KillTimer(NULL, id);
+    stage("boot_timer fired");
+    if (InterlockedExchange(&g_booted, 1) == 0) { HANDLE th = CreateThread(NULL, 0, bootstrap, NULL, 0, NULL); stage(th ? "boot_timer: bootstrap thread created" : "boot_timer: CreateThread FAILED"); }
 }
 
 BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
@@ -459,9 +478,10 @@ BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
         if (!strstr(exe, "Mewgenics")) return TRUE;
         g_self = h; g_base = (uint64_t)GetModuleHandleA(NULL);
         GetModuleFileNameA(h, g_dir, MAX_PATH); char *sl = strrchr(g_dir, '\\'); if (sl) *sl = 0;
+        snprintf(g_stagePath, sizeof g_stagePath, "%s\\stage.log", g_dir); stage("DllMain: attach");
         char lp[MAX_PATH]; snprintf(lp, sizeof lp, "%s\\mods_debug.log", g_dir); g_corelog = fopen(lp, "w");
         InitializeCriticalSection(&g_cs);
-        CreateThread(NULL, 0, bootstrap, NULL, 0, NULL);
+        stage(SetTimer(NULL, 0, 1000, boot_timer) ? "DllMain: boot timer set" : "DllMain: SetTimer FAILED");
     }
     return TRUE;
 }
